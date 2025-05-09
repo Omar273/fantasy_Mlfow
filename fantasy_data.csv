@@ -1,0 +1,3 @@
+position_QB,position_RB,position_WR,position_TE,age,experience,avg_points_last_season,team_strength,opponent_defense_rank,home_game,weather_bad,injury_questionable,injury_out,fantasy_points
+1,0,0,0,28,5,15.5,0.8,10,1,0,0,0,18.2
+0,1,0,0,25,3,12.0,0.6,15,0,1,1,0,10.5
