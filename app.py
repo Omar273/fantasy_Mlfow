@@ -1,3 +1,4 @@
+# app.py
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import pandas as pd
@@ -7,40 +8,32 @@ from typing import List
 import numpy as np
 from datetime import datetime
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_absolute_error, r2_score, root_mean_squared_error
-import mlflow
-import mlflow.sklearn
-from mlflow.models.signature import infer_signature
 import matplotlib
 import matplotlib.pyplot as plt
 import logging
+from elasticsearch import Elasticsearch
+from model import train_model
 
-# Set matplotlib to use non-interactive backend
+# Use non-interactive backend for matplotlib
 matplotlib.use("Agg")
 
-# Configure logging
+# Logging config
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# Elasticsearch client
+es = Elasticsearch("http://localhost:9200")
+
 app = FastAPI()
 
-# Define file paths
 MODEL_PATH = os.getenv("MODEL_PATH", "models/fantasy_model.pkl")
 SCALER_PATH = os.getenv("SCALER_PATH", "models/scaler.pkl")
 DATA_PATH = os.getenv("DATA_PATH", "data/fantasy_data.csv")
-PLOT_PATH = os.getenv("PLOT_PATH", "feature_importance.png")
 
-# Ensure directories exist
 os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
 os.makedirs(os.path.dirname(DATA_PATH), exist_ok=True)
 
-# Configure MLflow for file-based tracking
-mlflow.set_tracking_uri("file:///mlruns")
-mlflow.set_experiment("fantasy_football_predictor")
-
-# Load or initialize model and scaler
 try:
     if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH):
         model = joblib.load(MODEL_PATH)
@@ -54,9 +47,8 @@ try:
         logger.info("Initialized and saved new model and scaler")
 except Exception as e:
     logger.error(f"Failed to load/initialize model or scaler: {e}")
-    raise Exception("Failed to initialize model and scaler")
+    raise
 
-# Create sample data file if none exists
 if not os.path.exists(DATA_PATH):
     sample_data = pd.DataFrame({
         "position_QB": [1, 0],
@@ -77,7 +69,6 @@ if not os.path.exists(DATA_PATH):
     sample_data.to_csv(DATA_PATH, index=False)
     logger.info(f"Created sample data file at {DATA_PATH}")
 
-# Define input/output schemas
 class PlayerFeatures(BaseModel):
     player_id: str
     position: str = Field(..., pattern="^(QB|RB|WR|TE)$")
@@ -108,9 +99,8 @@ class RetrainResponse(BaseModel):
     model_performance: dict
     feature_importances: dict
 
-# Helper function to preprocess features
 def preprocess_features(player: PlayerFeatures) -> pd.DataFrame:
-    features = {
+    return pd.DataFrame([{
         "position_QB": 1 if player.position == "QB" else 0,
         "position_RB": 1 if player.position == "RB" else 0,
         "position_WR": 1 if player.position == "WR" else 0,
@@ -124,26 +114,8 @@ def preprocess_features(player: PlayerFeatures) -> pd.DataFrame:
         "weather_bad": 1 if player.weather_conditions == "bad" else 0,
         "injury_questionable": 1 if player.injury_status == "questionable" else 0,
         "injury_out": 1 if player.injury_status == "out" else 0,
-    }
-    return pd.DataFrame([features])
+    }])
 
-# Helper function to plot feature importance
-def plot_feature_importance(model, feature_names, output_path):
-    try:
-        importances = model.feature_importances_
-        indices = np.argsort(importances)[::-1]
-        plt.figure(figsize=(10, 6))
-        plt.title("Feature Importances")
-        plt.bar(range(len(importances)), importances[indices], align="center")
-        plt.xticks(range(len(importances)), [feature_names[i] for i in indices], rotation=90)
-        plt.tight_layout()
-        plt.savefig(output_path)
-        plt.close()
-        logger.info(f"Feature importance plot saved to {output_path}")
-    except Exception as e:
-        logger.error(f"Error generating feature importance plot: {e}")
-
-# Root endpoint
 @app.get("/")
 async def root():
     return {
@@ -155,7 +127,6 @@ async def root():
         },
     }
 
-# Prediction endpoint
 @app.post("/predict", response_model=List[PredictionResponse])
 async def predict(request: PredictionRequest):
     try:
@@ -167,19 +138,24 @@ async def predict(request: PredictionRequest):
             trees = [tree.predict(features_scaled)[0] for tree in model.estimators_]
             std = np.std(trees)
             confidence = [max(0, pred - 1.96 * std), pred + 1.96 * std]
-            predictions.append(
-                PredictionResponse(
-                    player_id=player.player_id,
-                    predicted_points=round(float(pred), 2),
-                    confidence_interval=[round(x, 2) for x in confidence],
-                )
-            )
+            predictions.append(PredictionResponse(
+                player_id=player.player_id,
+                predicted_points=round(float(pred), 2),
+                confidence_interval=[round(x, 2) for x in confidence]
+            ))
+            # Log prediction to Elasticsearch
+            es.index(index="predictions", document={
+                "timestamp": datetime.now().isoformat(),
+                "player_id": player.player_id,
+                "predicted_points": round(float(pred), 2),
+                "confidence_min": round(confidence[0], 2),
+                "confidence_max": round(confidence[1], 2)
+            })
         return predictions
     except Exception as e:
         logger.error(f"Prediction error: {e}")
         raise HTTPException(status_code=400, detail=f"Prediction failed: {str(e)}")
 
-# Retrain endpoint
 @app.post("/retrain", response_model=RetrainResponse)
 async def retrain(request: RetrainRequest):
     if not request.retrain:
@@ -189,103 +165,24 @@ async def retrain(request: RetrainRequest):
             model_performance={},
             feature_importances={},
         )
-
     try:
-        # Load and validate data
-        data = pd.read_csv(DATA_PATH)
-        if "fantasy_points" not in data.columns:
-            raise ValueError("Data must contain 'fantasy_points' column")
-        X = data.drop(columns=["fantasy_points"])
-        y = data["fantasy_points"]
-
-        # Validate features
-        expected_features = preprocess_features(PlayerFeatures(
-            player_id="test",
-            position="QB",
-            age=25,
-            experience=3,
-            avg_points_last_season=10.0,
-            team_strength=0.5,
-            opponent_defense_rank=16,
-            home_game=True,
-            weather_conditions="good",
-            injury_status="healthy",
-        )).columns
-        if set(X.columns) != set(expected_features):
-            raise ValueError(f"Input features {set(X.columns)} do not match expected {set(expected_features)}")
-
-        # Train-test split
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=request.test_size, random_state=42
-        )
-
-        # Start MLflow run
-        with mlflow.start_run(run_name=f"fantasy-predictor-{datetime.now().isoformat()}"):
-            # Retrain model
-            model = RandomForestRegressor(n_estimators=100, random_state=42)
-            scaler = StandardScaler()
-            X_train_scaled = scaler.fit_transform(X_train)
-            model.fit(X_train_scaled, y_train)
-
-            # Save model and scaler
-            joblib.dump(model, MODEL_PATH)
-            joblib.dump(scaler, SCALER_PATH)
-            logger.info("Model and scaler saved")
-
-            # Evaluate model
-            X_test_scaled = scaler.transform(X_test)
-            y_pred = model.predict(X_test_scaled)
-            mae = mean_absolute_error(y_test, y_pred)
-            r2 = r2_score(y_test, y_pred)
-            rmse = root_mean_squared_error(y_test, y_pred)
-
-            # Log parameters and metrics
-            mlflow.log_params({
-                "model_type": "RandomForestRegressor",
-                "n_estimators": 100,
-                "features": list(X_train.columns),
-                "target": "fantasy_points",
-                "test_size": request.test_size,
-            })
-            mlflow.log_metrics({
-                "mae": mae,
-                "r2": r2,
-                "rmse": rmse,
-            })
-
-            # Log model with signature
-            signature = infer_signature(X_train, model.predict(X_train_scaled))
-            mlflow.sklearn.log_model(
-                sk_model=model,
-                artifact_path="fantasy_model",
-                signature=signature,
-                registered_model_name="FantasyFootballPredictor",
-            )
-
-            # Log feature importance plot
-            plot_feature_importance(model, X_train.columns, PLOT_PATH)
-            mlflow.log_artifact(PLOT_PATH)
-
-            # Get feature importances
-            importances = dict(zip(X.columns, model.feature_importances_))
-
-        return RetrainResponse(
-            message="Model successfully retrained",
-            training_date=datetime.now().isoformat(),
-            model_performance={
-                "MAE": round(mae, 2),
-                "R2_score": round(r2, 2),
-                "RMSE": round(rmse, 2),
-                "test_size": request.test_size,
-            },
-            feature_importances=importances,
-        )
-
+        result = train_model(test_size=request.test_size)
+        global model, scaler
+        model = joblib.load(MODEL_PATH)
+        scaler = joblib.load(SCALER_PATH)
+        # Log retraining to Elasticsearch
+        es.index(index="retraining_logs", document={
+            "timestamp": result["training_date"],
+            "mae": result["model_performance"]["MAE"],
+            "r2": result["model_performance"]["R2_score"],
+            "rmse": result["model_performance"]["RMSE"],
+            "test_size": request.test_size
+        })
+        return RetrainResponse(**result)
     except Exception as e:
         logger.error(f"Retraining error: {e}")
         raise HTTPException(status_code=500, detail=f"Retraining failed: {str(e)}")
 
-# Feature documentation endpoint
 @app.get("/features")
 async def feature_documentation():
     return {
